@@ -149,11 +149,16 @@ class WaitForGraph:
 
 
 class LockManager:
-    def __init__(self, deadlock_detector: WaitForGraph):
+    def __init__(self, deadlock_detector: WaitForGraph, txn_manager=None):
         self.locks: Dict[Tuple[str, int], List[Lock]] = defaultdict(list)
+        self.pk_locks: Dict[Tuple[str, Any], List[Lock]] = defaultdict(list)
         self.deadlock_detector = deadlock_detector
+        self.txn_manager = txn_manager
         self.lock = threading.Lock()
         self.transaction_priority: Dict[str, int] = {}
+
+    def set_transaction_manager(self, txn_manager):
+        self.txn_manager = txn_manager
 
     def _set_priority(self, txn_id: str, priority: int):
         with self.lock:
@@ -227,6 +232,14 @@ class LockManager:
                 my_priority = self.transaction_priority.get(txn_id, 0)
                 min_priority = min(self.transaction_priority.get(t, 0) for t in cycle)
                 if my_priority <= min_priority:
+                    if self.txn_manager:
+                        txn = self.txn_manager.get_transaction(txn_id)
+                        if txn and txn.status == TransactionStatus.ACTIVE:
+                            txn.status = TransactionStatus.ABORTED
+                            txn.local_changes.clear()
+                            txn.deleted_rows.clear()
+                            txn.inserted_rows.clear()
+                            txn.savepoints.clear()
                     self.release_all_locks(txn_id)
                     raise DeadlockError(f"Deadlock detected, transaction {txn_id} chosen as victim")
 
@@ -253,6 +266,18 @@ class LockManager:
                 if not self.locks[key]:
                     del self.locks[key]
 
+            pk_keys_to_check = []
+            for key, locks in self.pk_locks.items():
+                for lock in locks:
+                    if lock.transaction_id == txn_id:
+                        pk_keys_to_check.append(key)
+                        break
+
+            for key in pk_keys_to_check:
+                self.pk_locks[key] = [l for l in self.pk_locks[key] if l.transaction_id != txn_id]
+                if not self.pk_locks[key]:
+                    del self.pk_locks[key]
+
             self.deadlock_detector.remove_transaction(txn_id)
 
     def get_locks_for_transaction(self, txn_id: str) -> List[Lock]:
@@ -262,7 +287,63 @@ class LockManager:
                 for lock in locks:
                     if lock.transaction_id == txn_id:
                         result.append(lock)
+            for locks in self.pk_locks.values():
+                for lock in locks:
+                    if lock.transaction_id == txn_id:
+                        result.append(lock)
             return result
+
+    def acquire_pk_lock(self, table_name: str, pk_value: Any, txn_id: str,
+                        timeout: float = 5.0) -> bool:
+        start_time = time.time()
+        key = (table_name, pk_value)
+
+        while True:
+            with self.lock:
+                existing = self.pk_locks.get(key, [])
+
+                has_exclusive = False
+                for lock in existing:
+                    if lock.transaction_id == txn_id:
+                        return True
+                    if lock.mode == LockMode.EXCLUSIVE:
+                        has_exclusive = True
+
+                if not has_exclusive:
+                    new_lock = Lock(table_name, -1, LockMode.EXCLUSIVE, txn_id)
+                    self.pk_locks[key].append(new_lock)
+                    for lock in existing:
+                        self.deadlock_detector.remove_edge(txn_id, lock.transaction_id)
+                    return True
+
+                holders = set(l.transaction_id for l in existing if l.transaction_id != txn_id)
+                for holder in holders:
+                    self.deadlock_detector.add_edge(txn_id, holder)
+
+            cycle = self.deadlock_detector.detect_cycle()
+            if cycle and txn_id in cycle:
+                my_priority = self.transaction_priority.get(txn_id, 0)
+                min_priority = min(self.transaction_priority.get(t, 0) for t in cycle)
+                if my_priority <= min_priority:
+                    if self.txn_manager:
+                        txn = self.txn_manager.get_transaction(txn_id)
+                        if txn and txn.status == TransactionStatus.ACTIVE:
+                            txn.status = TransactionStatus.ABORTED
+                            txn.local_changes.clear()
+                            txn.deleted_rows.clear()
+                            txn.inserted_rows.clear()
+                            txn.savepoints.clear()
+                    self.release_all_locks(txn_id)
+                    raise DeadlockError(f"Deadlock detected, transaction {txn_id} chosen as victim")
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                with self.lock:
+                    for holder in holders:
+                        self.deadlock_detector.remove_edge(txn_id, holder)
+                raise TimeoutError(f"PK lock acquisition timeout for {table_name}:{pk_value}")
+
+            time.sleep(0.01)
 
 
 class DeadlockError(Exception):
@@ -546,6 +627,7 @@ class Database:
         self.deadlock_detector = WaitForGraph()
         self.lock_manager = LockManager(self.deadlock_detector)
         self.txn_manager = TransactionManager(self.lock_manager)
+        self.lock_manager.set_transaction_manager(self.txn_manager)
         self.trigger_manager = TriggerManager()
         self.db_lock = threading.Lock()
         self._next_row_id_lock = threading.Lock()
@@ -615,8 +697,15 @@ class Database:
             validated = table._validate_row(data)
 
             pk_value = validated[table.primary_key]
+
+            self.lock_manager.acquire_pk_lock(table_name, pk_value, txn.txn_id)
+
+            for rid, rdata in txn.local_changes[table_name].items():
+                if rid != row_id and rdata and rdata.get(table.primary_key) == pk_value and rid not in txn.deleted_rows[table_name]:
+                    raise ValueError(f"Duplicate primary key in transaction: {pk_value}")
+
             existing_pk_row = table.find_by_pk(pk_value)
-            if existing_pk_row is not None:
+            if existing_pk_row is not None and existing_pk_row not in txn.deleted_rows[table_name]:
                 raise ValueError(f"Duplicate primary key: {pk_value}")
 
             txn.local_changes[table_name][row_id] = validated
@@ -652,6 +741,16 @@ class Database:
         try:
             self.lock_manager.acquire_lock(table_name, row_id, LockMode.EXCLUSIVE, txn.txn_id)
 
+            for col_name, value in data.items():
+                if col_name not in table.columns:
+                    raise ValueError(f"Unknown column: {col_name} in {table_name}")
+                if not table.columns[col_name].validate(value):
+                    raise ValueError(
+                        f"Invalid value for column {col_name}: {value} "
+                        f"(expected {table.columns[col_name].data_type.value}, "
+                        f"nullable={table.columns[col_name].nullable})"
+                    )
+
             new_row_data = old_row.copy()
             for k, v in data.items():
                 new_row_data[k] = v
@@ -660,6 +759,16 @@ class Database:
                 table_name, TriggerTiming.BEFORE, TriggerEvent.UPDATE,
                 txn, old_row=old_row, new_row=new_row_data, executor=self
             ) or new_row_data
+
+            for col_name, value in data.items():
+                if col_name in new_row_data:
+                    val = new_row_data[col_name]
+                    if not table.columns[col_name].validate(val):
+                        raise ValueError(
+                            f"Invalid value after trigger for column {col_name}: {val}"
+                        )
+                if col_name not in new_row_data:
+                    raise ValueError(f"Column {col_name} not found after trigger execution")
 
             update_data = {k: new_row_data[k] for k in data.keys() if k in new_row_data}
 
@@ -832,36 +941,60 @@ class Database:
 
     def commit(self, txn_id: str):
         txn = self.txn_manager.get_transaction(txn_id)
-        if not txn or txn.status != TransactionStatus.ACTIVE:
-            raise ValueError(f"Invalid transaction: {txn_id}")
+        if not txn:
+            raise ValueError(f"Transaction not found: {txn_id}")
+        if txn.status == TransactionStatus.ABORTED:
+            raise ValueError(f"Transaction {txn_id} was aborted (e.g., due to deadlock) and cannot be committed")
+        if txn.status != TransactionStatus.ACTIVE:
+            raise ValueError(f"Invalid transaction status: {txn.status} for {txn_id}")
 
-        table = None
-        for table_name in txn.local_changes:
-            table = self._get_table(table_name)
+        with self.db_lock:
+            for table_name, rows in txn.local_changes.items():
+                table = self._get_table(table_name)
+                pk_col = table.primary_key
 
-        for table_name, rows in txn.local_changes.items():
-            table = self._get_table(table_name)
-            for row_id, row_data in rows.items():
-                if row_data is None:
+                for row_id, row_data in rows.items():
+                    if row_data is not None and row_id in txn.inserted_rows[table_name]:
+                        pk_value = row_data[pk_col]
+                        existing_row_id = table.find_by_pk(pk_value)
+                        if existing_row_id is not None and existing_row_id != row_id:
+                            raise ValueError(f"Duplicate primary key on commit: {pk_value} in {table_name}")
+
+                for row_id, row_data in rows.items():
+                    if row_data is not None and row_id in txn.inserted_rows[table_name]:
+                        pk_value = row_data[pk_col]
+                        for other_rid, other_rdata in table.rows.items():
+                            if other_rid != row_id and other_rdata.get(pk_col) == pk_value:
+                                raise ValueError(f"Duplicate primary key on commit: {pk_value} in {table_name}")
+
+            for table_name, rows in txn.local_changes.items():
+                table = self._get_table(table_name)
+                for row_id, row_data in rows.items():
+                    if row_data is None:
+                        if row_id in table.rows:
+                            table.delete_row(row_id)
+                    else:
+                        if row_id in table.rows:
+                            old_data = table.rows[row_id]
+                            table._remove_from_indexes(row_id, old_data)
+                            table.rows[row_id] = row_data
+                            table._update_indexes(row_id, row_data)
+                        else:
+                            table.rows[row_id] = row_data
+                            table._update_indexes(row_id, row_data)
+
+                for row_id in txn.deleted_rows[table_name]:
                     if row_id in table.rows:
                         table.delete_row(row_id)
-                else:
-                    if row_id in table.rows:
-                        old_data = table.rows[row_id]
-                        table._remove_from_indexes(row_id, old_data)
-                        table.rows[row_id] = row_data
-                        table._update_indexes(row_id, row_data)
-                    else:
-                        table.rows[row_id] = row_data
-                        table._update_indexes(row_id, row_data)
-
-            for row_id in txn.deleted_rows[table_name]:
-                if row_id in table.rows:
-                    table.delete_row(row_id)
 
         self.txn_manager.commit(txn_id)
 
     def rollback(self, txn_id: str):
+        txn = self.txn_manager.get_transaction(txn_id)
+        if not txn:
+            return
+        if txn.status == TransactionStatus.COMMITTED:
+            raise ValueError(f"Transaction {txn_id} is already committed, cannot rollback")
         self.txn_manager.rollback(txn_id)
 
     def begin(self) -> str:
@@ -880,8 +1013,12 @@ class Database:
             txn._auto_commit = True
             return txn
         txn = self.txn_manager.get_transaction(txn_id)
-        if not txn or txn.status != TransactionStatus.ACTIVE:
-            raise ValueError(f"Invalid transaction: {txn_id}")
+        if not txn:
+            raise ValueError(f"Transaction not found: {txn_id}")
+        if txn.status == TransactionStatus.ABORTED:
+            raise ValueError(f"Transaction {txn_id} was aborted (e.g., due to deadlock) and cannot be used")
+        if txn.status != TransactionStatus.ACTIVE:
+            raise ValueError(f"Invalid transaction status: {txn.status} for {txn_id}")
         return txn
 
     def _get_row_for_txn(self, table: Table, row_id: int, txn: Transaction) -> Optional[Dict[str, Any]]:
@@ -903,24 +1040,46 @@ class Database:
                 continue
 
             ref_table = self.tables[fk.ref_table]
-            ref_row_id = ref_table.find_by_pk(fk_value) if fk.ref_column == ref_table.primary_key else None
+            matches = ref_table.find_by_column(fk.ref_column, fk_value)
+            ref_row_id = None
+            if matches:
+                ref_row_id = next(iter(matches))
 
-            if ref_row_id is None:
-                if fk.ref_column == ref_table.primary_key:
-                    matches = ref_table.find_by_column(fk.ref_column, fk_value)
-                else:
-                    matches = ref_table.find_by_column(fk.ref_column, fk_value)
-                if not matches:
-                    in_txn = False
-                    for rid, rdata in txn.local_changes[fk.ref_table].items():
-                        if rdata and rdata.get(fk.ref_column) == fk_value and rid not in txn.deleted_rows[fk.ref_table]:
-                            in_txn = True
-                            break
-                    if not in_txn:
-                        raise ValueError(
-                            f"Foreign key violation: {fk.column}={fk_value} "
-                            f"references non-existent row in {fk.ref_table}.{fk.ref_column}"
-                        )
+            in_txn_ref_row_id = None
+            for rid, rdata in txn.local_changes[fk.ref_table].items():
+                if rdata and rdata.get(fk.ref_column) == fk_value and rid not in txn.deleted_rows[fk.ref_table]:
+                    in_txn_ref_row_id = rid
+                    break
+
+            if ref_row_id is None and in_txn_ref_row_id is None:
+                raise ValueError(
+                    f"Foreign key violation: {fk.column}={fk_value} "
+                    f"references non-existent row in {fk.ref_table}.{fk.ref_column}"
+                )
+
+            if ref_row_id is not None:
+                try:
+                    self.lock_manager.acquire_lock(
+                        fk.ref_table, ref_row_id, LockMode.EXCLUSIVE, txn.txn_id
+                    )
+                except DeadlockError:
+                    raise
+
+                current_ref_row = ref_table.rows.get(ref_row_id)
+                if (current_ref_row is None or
+                    ref_row_id in txn.deleted_rows[fk.ref_table] or
+                    (ref_row_id in txn.local_changes[fk.ref_table] and
+                     txn.local_changes[fk.ref_table][ref_row_id] is None)):
+                    raise ValueError(
+                        f"Foreign key violation: {fk.column}={fk_value} "
+                        f"referenced row was deleted in {fk.ref_table}"
+                    )
+
+                if in_txn_ref_row_id is None and current_ref_row.get(fk.ref_column) != fk_value:
+                    raise ValueError(
+                        f"Foreign key violation: {fk.column}={fk_value} "
+                        f"referenced row was modified in {fk.ref_table}"
+                    )
 
     def _check_foreign_keys_on_update(self, table: Table, row_id: int,
                                        old_row: Dict[str, Any], new_row: Dict[str, Any],
@@ -937,17 +1096,44 @@ class Database:
 
             ref_table = self.tables[fk.ref_table]
             matches = ref_table.find_by_column(fk.ref_column, fk_value)
+            ref_row_id = None
+            if matches:
+                ref_row_id = next(iter(matches))
 
-            if not matches:
-                in_txn = False
-                for rid, rdata in txn.local_changes[fk.ref_table].items():
-                    if rdata and rdata.get(fk.ref_column) == fk_value and rid not in txn.deleted_rows[fk.ref_table]:
-                        in_txn = True
-                        break
-                if not in_txn:
+            in_txn_ref_row_id = None
+            for rid, rdata in txn.local_changes[fk.ref_table].items():
+                if rdata and rdata.get(fk.ref_column) == fk_value and rid not in txn.deleted_rows[fk.ref_table]:
+                    in_txn_ref_row_id = rid
+                    break
+
+            if ref_row_id is None and in_txn_ref_row_id is None:
+                raise ValueError(
+                    f"Foreign key violation: {fk.column}={fk_value} "
+                    f"references non-existent row in {fk.ref_table}.{fk.ref_column}"
+                )
+
+            if ref_row_id is not None:
+                try:
+                    self.lock_manager.acquire_lock(
+                        fk.ref_table, ref_row_id, LockMode.EXCLUSIVE, txn.txn_id
+                    )
+                except DeadlockError:
+                    raise
+
+                current_ref_row = ref_table.rows.get(ref_row_id)
+                if (current_ref_row is None or
+                    ref_row_id in txn.deleted_rows[fk.ref_table] or
+                    (ref_row_id in txn.local_changes[fk.ref_table] and
+                     txn.local_changes[fk.ref_table][ref_row_id] is None)):
                     raise ValueError(
                         f"Foreign key violation: {fk.column}={fk_value} "
-                        f"references non-existent row in {fk.ref_table}.{fk.ref_column}"
+                        f"referenced row was deleted in {fk.ref_table}"
+                    )
+
+                if in_txn_ref_row_id is None and current_ref_row.get(fk.ref_column) != fk_value:
+                    raise ValueError(
+                        f"Foreign key violation: {fk.column}={fk_value} "
+                        f"referenced row was modified in {fk.ref_table}"
                     )
 
         for ref_table_name, fk in table.referenced_by:
@@ -980,6 +1166,13 @@ class Database:
                         if ref_row:
                             self.update(ref_table_name, rid, {fk.column: new_ref_val}, txn.txn_id)
             elif fk.on_update == ForeignKeyAction.SET_NULL:
+                fk_col = ref_table.columns[fk.column]
+                if not fk_col.nullable:
+                    raise ValueError(
+                        f"Cannot update {table.name}.{fk.ref_column}: "
+                        f"foreign key column {ref_table_name}.{fk.column} is NOT NULL, "
+                        f"SET NULL would violate NOT NULL constraint"
+                    )
                 referencing_row_ids = ref_table.find_by_column(fk.column, old_ref_val)
                 for rid in referencing_row_ids:
                     if rid not in txn.deleted_rows[ref_table_name]:
@@ -1023,6 +1216,13 @@ class Database:
                     if current:
                         self.delete(ref_table_name, rid, txn.txn_id)
             elif fk.on_delete == ForeignKeyAction.SET_NULL:
+                fk_col = ref_table.columns[fk.column]
+                if not fk_col.nullable:
+                    raise ValueError(
+                        f"Cannot delete row from {table.name}: "
+                        f"foreign key column {ref_table_name}.{fk.column} is NOT NULL, "
+                        f"SET NULL would violate NOT NULL constraint"
+                    )
                 for rid in active_referencing:
                     current = self._get_row_for_txn(ref_table, rid, txn)
                     if current:
