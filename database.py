@@ -407,8 +407,10 @@ class TransactionManager:
 
     def rollback(self, txn_id: str):
         txn = self.get_transaction(txn_id)
-        if not txn or txn.status != TransactionStatus.ACTIVE:
-            raise ValueError(f"Invalid transaction: {txn_id}")
+        if not txn:
+            return
+        if txn.status == TransactionStatus.COMMITTED:
+            raise ValueError(f"Transaction {txn_id} is already committed, cannot rollback")
         txn.status = TransactionStatus.ABORTED
         txn.local_changes.clear()
         txn.deleted_rows.clear()
@@ -421,8 +423,12 @@ class TransactionManager:
 
     def savepoint(self, txn_id: str, name: str):
         txn = self.get_transaction(txn_id)
-        if not txn or txn.status != TransactionStatus.ACTIVE:
-            raise ValueError(f"Invalid transaction: {txn_id}")
+        if not txn:
+            raise ValueError(f"Transaction not found: {txn_id}")
+        if txn.status == TransactionStatus.ABORTED:
+            raise ValueError(f"Transaction {txn_id} is aborted, cannot set savepoint")
+        if txn.status != TransactionStatus.ACTIVE:
+            raise ValueError(f"Invalid transaction status: {txn.status} for {txn_id}")
         snapshot = defaultdict(dict)
         for table, rows in txn.local_changes.items():
             snapshot[table] = rows.copy()
@@ -440,8 +446,12 @@ class TransactionManager:
 
     def rollback_to_savepoint(self, txn_id: str, name: str):
         txn = self.get_transaction(txn_id)
-        if not txn or txn.status != TransactionStatus.ACTIVE:
-            raise ValueError(f"Invalid transaction: {txn_id}")
+        if not txn:
+            raise ValueError(f"Transaction not found: {txn_id}")
+        if txn.status == TransactionStatus.ABORTED:
+            raise ValueError(f"Transaction {txn_id} is aborted, cannot rollback savepoint")
+        if txn.status != TransactionStatus.ACTIVE:
+            raise ValueError(f"Invalid transaction status: {txn.status} for {txn_id}")
 
         sp = None
         idx = -1
@@ -629,7 +639,7 @@ class Database:
         self.txn_manager = TransactionManager(self.lock_manager)
         self.lock_manager.set_transaction_manager(self.txn_manager)
         self.trigger_manager = TriggerManager()
-        self.db_lock = threading.Lock()
+        self.db_lock = threading.RLock()
         self._next_row_id_lock = threading.Lock()
         self._next_row_ids: Dict[str, int] = defaultdict(int)
 
@@ -687,6 +697,24 @@ class Database:
             )
             if new_row is not None:
                 data = new_row
+
+            for col_name, col in table.columns.items():
+                if col_name not in data:
+                    if col.default is not None:
+                        data[col_name] = col.default
+                    elif col.nullable:
+                        data[col_name] = None
+                    else:
+                        raise ValueError(
+                            f"Missing required column after trigger: {col_name}"
+                        )
+
+            extra_cols = set(data.keys()) - set(table.columns.keys())
+            if extra_cols:
+                raise ValueError(
+                    f"Unknown column(s) after trigger: {', '.join(sorted(extra_cols))} "
+                    f"in table {table_name}"
+                )
 
             self._check_foreign_keys_on_insert(table, data, txn)
 
@@ -760,28 +788,42 @@ class Database:
                 txn, old_row=old_row, new_row=new_row_data, executor=self
             ) or new_row_data
 
-            for col_name, value in data.items():
-                if col_name in new_row_data:
-                    val = new_row_data[col_name]
-                    if not table.columns[col_name].validate(val):
-                        raise ValueError(
-                            f"Invalid value after trigger for column {col_name}: {val}"
-                        )
+            for col_name, col in table.columns.items():
                 if col_name not in new_row_data:
-                    raise ValueError(f"Column {col_name} not found after trigger execution")
+                    raise ValueError(
+                        f"Missing required column after trigger: {col_name}"
+                    )
+                val = new_row_data[col_name]
+                if not col.validate(val):
+                    raise ValueError(
+                        f"Invalid value after trigger for column {col_name}: {val} "
+                        f"(expected {col.data_type.value}, nullable={col.nullable})"
+                    )
+
+            extra_cols = set(new_row_data.keys()) - set(table.columns.keys())
+            if extra_cols:
+                raise ValueError(
+                    f"Unknown column(s) after trigger: {', '.join(sorted(extra_cols))} "
+                    f"in table {table_name}"
+                )
 
             update_data = {k: new_row_data[k] for k in data.keys() if k in new_row_data}
 
             self._check_foreign_keys_on_update(table, row_id, old_row, new_row_data, txn)
 
-            if table.primary_key in data:
+            if table.primary_key in data or new_row_data.get(table.primary_key) != old_row.get(table.primary_key):
                 new_pk = new_row_data[table.primary_key]
+                old_pk = old_row.get(table.primary_key)
+
+                if new_pk != old_pk:
+                    self.lock_manager.acquire_pk_lock(table_name, new_pk, txn.txn_id)
+
                 for rid, row in table.rows.items():
                     if rid != row_id and row[table.primary_key] == new_pk:
-                        raise ValueError(f"Duplicate primary key: {new_pk}")
+                        raise ValueError(f"Duplicate primary key on update: {new_pk}")
                 for rid, row in txn.local_changes[table_name].items():
-                    if rid != row_id and row and row[table.primary_key] == new_pk:
-                        raise ValueError(f"Duplicate primary key: {new_pk}")
+                    if rid != row_id and row and row.get(table.primary_key) == new_pk and rid not in txn.deleted_rows[table_name]:
+                        raise ValueError(f"Duplicate primary key on update: {new_pk}")
 
             txn.local_changes[table_name][row_id] = new_row_data
             if row_id in txn.deleted_rows[table_name]:
@@ -953,19 +995,35 @@ class Database:
                 table = self._get_table(table_name)
                 pk_col = table.primary_key
 
-                for row_id, row_data in rows.items():
-                    if row_data is not None and row_id in txn.inserted_rows[table_name]:
-                        pk_value = row_data[pk_col]
-                        existing_row_id = table.find_by_pk(pk_value)
-                        if existing_row_id is not None and existing_row_id != row_id:
-                            raise ValueError(f"Duplicate primary key on commit: {pk_value} in {table_name}")
+                committed_pks = {}
+                for other_rid, other_rdata in table.rows.items():
+                    committed_pks.setdefault(other_rdata[pk_col], []).append(other_rid)
 
                 for row_id, row_data in rows.items():
-                    if row_data is not None and row_id in txn.inserted_rows[table_name]:
-                        pk_value = row_data[pk_col]
-                        for other_rid, other_rdata in table.rows.items():
-                            if other_rid != row_id and other_rdata.get(pk_col) == pk_value:
-                                raise ValueError(f"Duplicate primary key on commit: {pk_value} in {table_name}")
+                    if row_data is None:
+                        continue
+                    pk_value = row_data[pk_col]
+                    if row_id in txn.inserted_rows[table_name]:
+                        matching_rows = committed_pks.get(pk_value, [])
+                        if matching_rows:
+                            raise ValueError(f"Duplicate primary key on commit: {pk_value} in {table_name}")
+                    else:
+                        existing_row = table.rows.get(row_id)
+                        old_pk = existing_row.get(pk_col) if existing_row else None
+                        if old_pk != pk_value:
+                            matching_rows = committed_pks.get(pk_value, [])
+                            if any(rid != row_id for rid in matching_rows):
+                                raise ValueError(f"Duplicate primary key on commit (update): {pk_value} in {table_name}")
+
+                txn_pks = defaultdict(list)
+                for row_id, row_data in rows.items():
+                    if row_data is None or row_id in txn.deleted_rows[table_name]:
+                        continue
+                    pk_value = row_data[pk_col]
+                    txn_pks[pk_value].append(row_id)
+                for pk_value, rids in txn_pks.items():
+                    if len(rids) > 1:
+                        raise ValueError(f"Duplicate primary key in transaction: {pk_value} in {table_name}")
 
             for table_name, rows in txn.local_changes.items():
                 table = self._get_table(table_name)
